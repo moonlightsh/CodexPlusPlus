@@ -2151,6 +2151,8 @@ struct FakeHooks {
     helper_bind_forbidden: bool,
     /// 模拟与占用/保留都无关的其他 bind 失败，验证错误原样冒泡。
     helper_bind_other_error: Option<String>,
+    /// 受管启动编排的模拟：None = 凭据缺失（默认实现路径），Some(true) = 就绪，Some(false) = 检查失败。
+    managed_gateway_ready: Option<bool>,
 }
 
 impl FakeHooks {
@@ -2171,7 +2173,13 @@ impl FakeHooks {
             remaining_helper_bind_conflicts: Arc::new(Mutex::new(0)),
             helper_bind_forbidden: false,
             helper_bind_other_error: None,
+            managed_gateway_ready: None,
         }
+    }
+
+    fn with_managed_gateway_ready(mut self, ready: Option<bool>) -> Self {
+        self.managed_gateway_ready = ready;
+        self
     }
 
     fn with_helper_bind_conflicts(self, conflicts: u32) -> Self {
@@ -2231,6 +2239,38 @@ impl FakeHooks {
 
 #[async_trait::async_trait(?Send)]
 impl LaunchHooks for FakeHooks {
+    fn managed_gateway_enabled(&self, settings: &BackendSettings) -> bool {
+        // 测试钩子不受 cfg!(windows) 限制，只看设置开关，便于在任意平台验证编排。
+        settings.windows_managed_gateway_enabled
+    }
+
+    async fn open_manager_for_initialization(&self) -> anyhow::Result<()> {
+        self.event("open-manager-for-initialization");
+        Ok(())
+    }
+
+    async fn ensure_managed_gateway_ready(
+        &self,
+        _home: &std::path::Path,
+        _helper_port: u16,
+    ) -> anyhow::Result<()> {
+        match &self.managed_gateway_ready {
+            Some(true) => {
+                self.event("ensure-managed-gateway-ready");
+                Ok(())
+            }
+            Some(false) => {
+                self.event("ensure-managed-gateway-ready");
+                anyhow::bail!("受管网关自检失败");
+            }
+            // None = 模拟凭据缺失：走「打开初始化页 + 阻断」路径。
+            None => {
+                self.event("ensure-managed-gateway-credential-missing");
+                anyhow::bail!("未配置模型网关 API Key，已打开管理工具初始化页");
+            }
+        }
+    }
+
     fn resolve_app_dir(
         &self,
         app_dir: Option<&Path>,
@@ -2357,7 +2397,10 @@ impl LaunchHooks for FakeHooks {
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
         assert!(app_dir.ends_with("Codex.app"));
-        self.event(format!("launch-helper-port:{helper_port}"));
+        // 仅在受管编排启用时记录 helper_port 事件，避免污染既有事件序列断言。
+        if self.managed_gateway_ready.is_some() {
+            self.event(format!("launch-helper-port:{helper_port}"));
+        }
         let launch_detail = if extra_args.is_empty() {
             format!("launch:{debug_port}")
         } else {
@@ -2419,4 +2462,95 @@ impl LaunchHooks for FakeHooks {
             self.event("terminate-codex");
         }
     }
+}
+
+#[tokio::test]
+async fn managed_gateway_missing_credential_blocks_launch_and_opens_manager() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone()).with_settings(BackendSettings {
+        windows_managed_gateway_enabled: true,
+        enhancements_enabled: false,
+        ..BackendSettings::default()
+    });
+    // managed_gateway_ready = None 模拟凭据缺失
+
+    let result = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store,
+        },
+        &hooks,
+    )
+    .await;
+
+    let error = result.err().expect("凭据缺失必须阻断启动");
+    assert!(error.to_string().contains("初始化"));
+    let events = events.lock().unwrap().clone();
+    assert!(
+        events
+            .iter()
+            .any(|event| event == "ensure-managed-gateway-credential-missing"),
+        "events: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|event| event.starts_with("launch:")),
+        "Codex 不得被启动: {events:?}"
+    );
+    // 失败路径会关停已启动的 helper
+    assert!(
+        events
+            .iter()
+            .any(|event| event.starts_with("shutdown-helper:"))
+    );
+    assert!(events.iter().any(|event| event == "status:failed"));
+}
+
+#[tokio::test]
+async fn managed_gateway_ready_proceeds_to_launch_with_helper_port() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("Codex.app");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    let status_store = StatusStore::new(temp.path().join("latest-status.json"));
+    let events = Arc::new(Mutex::new(Vec::<String>::new()));
+    let hooks = FakeHooks::new(events.clone())
+        .with_settings(BackendSettings {
+            windows_managed_gateway_enabled: true,
+            enhancements_enabled: false,
+            ..BackendSettings::default()
+        })
+        .with_managed_gateway_ready(Some(true));
+
+    let handle = launch_and_inject_with_hooks(
+        LaunchOptions {
+            app_dir: Some(app_dir),
+            debug_port: 9229,
+            helper_port: 57321,
+            status_store,
+        },
+        &hooks,
+    )
+    .await
+    .unwrap();
+    handle.wait_for_codex_exit().await.unwrap();
+
+    let events = events.lock().unwrap().clone();
+    let ready_index = events
+        .iter()
+        .position(|event| event == "ensure-managed-gateway-ready")
+        .expect("受管编排必须执行");
+    let launch_index = events
+        .iter()
+        .position(|event| event.starts_with("launch-helper-port:"))
+        .expect("launch_codex 必须被调用");
+    assert!(ready_index < launch_index, "受管检查必须在启动之前");
+    assert!(
+        events.contains(&"launch-helper-port:57321".to_string()),
+        "events: {events:?}"
+    );
 }

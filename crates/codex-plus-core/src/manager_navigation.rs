@@ -119,7 +119,7 @@ fn remove_pending_manager_navigation_if_matches_at(
 
 fn validate_navigation(navigation: &ManagerNavigationIntent) -> anyhow::Result<()> {
     match (navigation.page.as_str(), navigation.section.as_deref()) {
-        ("settings", None | Some("stepwise")) => Ok(()),
+        ("settings", None | Some("stepwise") | Some("managedGateway")) => Ok(()),
         _ => anyhow::bail!(
             "不支持的管理工具导航：{}/{}",
             navigation.page,
@@ -148,6 +148,16 @@ mod tests {
             Some(navigation)
         );
         assert_eq!(consume_pending_manager_navigation_at(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn saves_managed_gateway_navigation() {
+        let navigation = ManagerNavigationIntent {
+            page: "settings".to_string(),
+            section: Some("managedGateway".to_string()),
+        };
+
+        assert!(validate_navigation(&navigation).is_ok());
     }
 
     #[test]

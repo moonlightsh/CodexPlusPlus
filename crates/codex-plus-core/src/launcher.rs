@@ -187,6 +187,23 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+    /// 受管模型网关是否在本次启动生效（Windows-only + 设置开关）。
+    fn managed_gateway_enabled(&self, settings: &BackendSettings) -> bool {
+        cfg!(windows) && settings.windows_managed_gateway_enabled
+    }
+    /// 凭据缺失时打开管理工具初始化页；默认拉起伴生 manager 二进制。
+    async fn open_manager_for_initialization(&self) -> anyhow::Result<()> {
+        crate::install::open_or_activate_manager().map(|_| ())
+    }
+    /// 受管启动编排：凭据检查 → 配置校正 → PAC 自检 → TCP 连通性检查。
+    /// 任一环节失败都不启动 Codex。
+    async fn ensure_managed_gateway_ready(
+        &self,
+        home: &Path,
+        helper_port: u16,
+    ) -> anyhow::Result<()> {
+        default_ensure_managed_gateway_ready(home, helper_port).await
+    }
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
     async fn launch_codex(
         &self,
@@ -467,11 +484,12 @@ where
         }
         let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
             || remote_control_provider_proxy_enabled(&settings);
+        let managed_gateway_active = hooks.managed_gateway_enabled(&settings);
         if protocol_proxy_enabled {
             hooks.ensure_active_protocol_proxy_config(&settings).await?;
             helper_port = crate::protocol_proxy::protocol_proxy_port();
         }
-        if settings.enhancements_enabled || protocol_proxy_enabled {
+        if settings.enhancements_enabled || protocol_proxy_enabled || managed_gateway_active {
             // macOS 重启时旧 launcher 的 socket 释放可能稍晚于进程退出。
             let bind_retry_timeout_ms =
                 helper_bind_retry_timeout_ms(protocol_proxy_enabled, cfg!(target_os = "macos"));
@@ -490,6 +508,9 @@ where
                 )
             })?;
             helper_started = true;
+        }
+        if managed_gateway_active {
+            hooks.ensure_managed_gateway_ready(&home, helper_port).await?;
         }
 
         let launch = hooks
@@ -563,11 +584,10 @@ where
             if helper_started {
                 hooks.shutdown_helper(helper_port).await;
             }
-            if let Some(launch) = &launched {
-                if !keep_launched_on_error {
+            if let Some(launch) = &launched
+                && !keep_launched_on_error {
                     hooks.terminate_codex(launch).await;
                 }
-            }
             let message = error.to_string();
             let failure = launch_status("failed", &message, debug_port, helper_port, &app_dir);
             let _ = status_store.save_latest(&failure);
@@ -680,6 +700,75 @@ fn helper_bind_host() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+/// 默认受管启动编排实现（供 LaunchHooks 默认与测试复用）。
+pub(crate) async fn default_ensure_managed_gateway_ready(
+    home: &Path,
+    helper_port: u16,
+) -> anyhow::Result<()> {
+    use crate::managed_gateway as mg;
+    if !mg::managed_gateway_credential_exists() {
+        let _ = crate::manager_navigation::save_pending_manager_navigation(
+            &crate::manager_navigation::ManagerNavigationIntent {
+                page: "settings".to_string(),
+                section: Some("managedGateway".to_string()),
+            },
+        );
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.managed_gateway_credential_missing",
+            serde_json::json!({ "helper_port": helper_port }),
+        );
+        anyhow::bail!("未配置模型网关 API Key，已打开管理工具初始化页");
+    }
+    mg::apply_managed_gateway_to_config(home, &mg::managed_gateway_credential_command())?;
+    verify_managed_pac_endpoint(helper_port).await?;
+    verify_tcp_connectivity("10.20.30.61", mg::MANAGED_GATEWAY_SOCKS5_PORT).await?;
+    verify_tcp_connectivity("10.20.30.61", 8080).await?;
+    Ok(())
+}
+
+/// PAC 自检：状态码、内容类型、核心代理结果。失败则不启动 Codex。
+async fn verify_managed_pac_endpoint(helper_port: u16) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let response = client
+        .get(format!("http://127.0.0.1:{helper_port}/proxy.pac"))
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("PAC 自检请求失败：{error}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("PAC 自检失败：状态码 {}", response.status());
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type.contains("application/x-ns-proxy-autoconfig") {
+        anyhow::bail!("PAC 自检失败：内容类型不是 {content_type}");
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|error| anyhow::anyhow!("PAC 自检读取失败：{error}"))?;
+    if !body.contains(crate::managed_gateway::MANAGED_GATEWAY_SOCKS5_RESULT) {
+        anyhow::bail!("PAC 自检失败：缺少 SOCKS5 结果");
+    }
+    Ok(())
+}
+
+/// TCP 连通性检查：只用于给出明确错误，不代表业务请求验证成功。
+async fn verify_tcp_connectivity(host: &str, port: u16) -> anyhow::Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("无法连接 {host}:{port}（超时）"))?
+    .map_err(|error| anyhow::anyhow!("无法连接 {host}:{port}：{error}"))?;
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -1096,8 +1185,8 @@ impl LaunchHooks for DefaultLaunchHooks {
                 }
             }
             CodexLaunch::PackagedActivation { process_id, .. } => {
-                if let Some(process_id) = process_id {
-                    if let Err(error) = wait_for_windows_process_id(*process_id).await {
+                if let Some(process_id) = process_id
+                    && let Err(error) = wait_for_windows_process_id(*process_id).await {
                         let _ = crate::diagnostic_log::append_diagnostic_log(
                             "launcher.packaged_process_wait_failed_nonfatal",
                             serde_json::json!({
@@ -1106,7 +1195,6 @@ impl LaunchHooks for DefaultLaunchHooks {
                             }),
                         );
                     }
-                }
             }
         }
         let mut empty_streak = 0u32;
@@ -1459,9 +1547,7 @@ async fn handle_helper_connection(
         }),
     );
     let response = if method == "OPTIONS" {
-        format!(
-            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        )
+        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
     } else {
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
