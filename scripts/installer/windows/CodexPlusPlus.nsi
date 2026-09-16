@@ -35,6 +35,7 @@ Section "Install"
 
   File "${ROOT}\dist\windows\app\codex-plus-plus.exe"
   File "${ROOT}\dist\windows\app\codex-plus-plus-manager.exe"
+  File "${ROOT}\dist\windows\app\codex-plus-credential.exe"
 
   Delete "$DESKTOP\Codex++ 绠＄悊宸ュ叿.lnk"
   Delete "$SMPROGRAMS\Codex++\Codex++ 绠＄悊宸ュ叿.lnk"
@@ -73,6 +74,7 @@ Section "Uninstall"
 
   Delete "$INSTDIR\codex-plus-plus.exe"
   Delete "$INSTDIR\codex-plus-plus-manager.exe"
+  Delete "$INSTDIR\codex-plus-credential.exe"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 
