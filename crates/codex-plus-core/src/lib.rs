@@ -23,6 +23,7 @@ pub mod install;
 pub mod launcher;
 pub mod managed_gateway;
 pub mod manager_navigation;
+pub mod credential;
 pub mod mcp_config;
 pub mod model_catalog;
 pub mod model_suffix;
