@@ -165,6 +165,101 @@ pub fn inject_managed_pac_arg(args: &[String], helper_port: u16) -> Vec<String> 
     out
 }
 
+use std::path::Path;
+
+/// 受管 provider 在 config.toml 中的固定标识。
+pub const MANAGED_GATEWAY_PROVIDER_ID: &str = "managed_gateway";
+/// 凭据在 Windows Credential Manager 中的固定 target。
+pub const MANAGED_GATEWAY_CREDENTIAL_TARGET: &str = "managed-gateway";
+
+/// 原子写校正受管内容：`model_provider` 与 `[model_providers.managed_gateway]`。
+///
+/// 只校正受管键，其他 Codex 配置与官方登录数据保留。写入前备份、写入失败时恢复。
+pub fn apply_managed_gateway_to_config(home: &Path, credential_command: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(home)?;
+    let config_path = home.join("config.toml");
+    let contents = std::fs::read_to_string(&config_path).unwrap_or_default();
+    // 损坏或缺失的 config 视为空配置；原文保留在备份里可恢复。
+    let mut doc = contents
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_default();
+    doc["model_provider"] = toml_edit::value(MANAGED_GATEWAY_PROVIDER_ID);
+    let root = doc.as_table_mut();
+    let providers = root
+        .entry("model_providers")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let Some(table) = providers.as_table_mut() else {
+        anyhow::bail!("model_providers 不是 table，无法写入受管 provider");
+    };
+    let provider = table
+        .entry(MANAGED_GATEWAY_PROVIDER_ID)
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let Some(provider) = provider.as_table_mut() else {
+        anyhow::bail!("model_providers.managed_gateway 不是 table");
+    };
+    provider["name"] = toml_edit::value("Managed Gateway");
+    provider["base_url"] = toml_edit::value(MANAGED_GATEWAY_BASE_URL);
+    provider["wire_api"] = toml_edit::value("responses");
+    // 命令鉴权与 env_key / experimental_bearer_token / requires_openai_auth 互斥
+    for key in ["env_key", "experimental_bearer_token", "requires_openai_auth"] {
+        provider.remove(key);
+    }
+    let auth = provider
+        .entry("auth")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+    let Some(auth) = auth.as_table_mut() else {
+        anyhow::bail!("model_providers.managed_gateway.auth 不是 table");
+    };
+    auth["command"] = toml_edit::value(credential_command);
+    let mut args = toml_edit::Array::new();
+    args.push("get");
+    args.push(MANAGED_GATEWAY_CREDENTIAL_TARGET);
+    auth["args"] = toml_edit::value(args);
+    let updated = doc.to_string();
+    if contents != updated && config_path.exists() {
+        let backup = config_path.with_extension("toml.managed-gateway-bak");
+        std::fs::copy(&config_path, &backup)?;
+    }
+    if let Err(error) = crate::settings::atomic_write(&config_path, updated.as_bytes()) {
+        let backup = config_path.with_extension("toml.managed-gateway-bak");
+        if backup.exists() {
+            let _ = std::fs::copy(&backup, &config_path);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// 检测现有 config.toml 中的外部 `model_catalog_json` 指针（会影响内置模型目录目标）。
+pub fn managed_gateway_config_conflicts(home: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(home.join("config.toml")).ok()?;
+    let doc = contents.parse::<toml_edit::DocumentMut>().ok()?;
+    doc.get("model_catalog_json")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// 备份后仅移除 `model_catalog_json` 根键，不删除外部 catalog 文件本身。
+/// 返回备份路径；无指针时返回 None。
+pub fn remove_external_model_catalog_pointer(home: &Path) -> anyhow::Result<Option<String>> {
+    if managed_gateway_config_conflicts(home).is_none() {
+        return Ok(None);
+    }
+    let config_path = home.join("config.toml");
+    let contents = std::fs::read_to_string(&config_path)?;
+    let mut doc = contents.parse::<toml_edit::DocumentMut>()?;
+    doc.as_table_mut().remove("model_catalog_json");
+    let backup_dir = crate::paths::default_app_state_dir().join("managed-gateway-backups");
+    std::fs::create_dir_all(&backup_dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis();
+    let backup = backup_dir.join(format!("config-{stamp}.toml"));
+    std::fs::write(&backup, &contents)?;
+    crate::settings::atomic_write(&config_path, doc.to_string().as_bytes())?;
+    Ok(Some(backup.to_string_lossy().to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +374,98 @@ mod tests {
     fn inject_appends_when_no_existing_pac_args() {
         let out = inject_managed_pac_arg(&[], 9);
         assert_eq!(out, vec!["--proxy-pac-url=http://127.0.0.1:9/proxy.pac"]);
+    }
+
+    #[test]
+    fn apply_writes_provider_command_auth_and_preserves_unrelated_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::write(
+            home.join("config.toml"),
+            "model = \"gpt-5.2-codex\"\n# 用户注释\n[model_providers.custom]\nname = \"Custom\"\n",
+        )
+        .unwrap();
+        apply_managed_gateway_to_config(
+            home,
+            "C:\\Program Files\\Codex++\\codex-plus-credential.exe",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(text.contains("model_provider = \"managed_gateway\""));
+        assert!(text.contains("[model_providers.managed_gateway]"));
+        assert!(text.contains("base_url = \"http://10.20.30.61:8080\""));
+        assert!(text.contains("wire_api = \"responses\""));
+        assert!(text.contains("args = [\"get\", \"managed-gateway\"]"));
+        assert!(text.contains("model = \"gpt-5.2-codex\""));
+        assert!(text.contains("# 用户注释"));
+        assert!(text.contains("[model_providers.custom]"));
+        assert!(!text.contains("env_key"));
+        assert!(!text.contains("experimental_bearer_token"));
+        assert!(!text.contains("requires_openai_auth = true"));
+    }
+
+    #[test]
+    fn apply_corrects_drift_on_every_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        apply_managed_gateway_to_config(home, "C:\\x\\codex-plus-credential.exe").unwrap();
+        let text = std::fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .replace("http://10.20.30.61:8080", "http://evil:1");
+        std::fs::write(home.join("config.toml"), text).unwrap();
+        apply_managed_gateway_to_config(home, "C:\\x\\codex-plus-credential.exe").unwrap();
+        let text = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(text.contains("http://10.20.30.61:8080"));
+        assert!(text.contains("model_provider = \"managed_gateway\""));
+    }
+
+    #[test]
+    fn apply_creates_config_when_missing_and_tolerates_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        apply_managed_gateway_to_config(home, "C:\\x\\codex-plus-credential.exe").unwrap();
+        assert!(home.join("config.toml").exists());
+        // 损坏的 config.toml：备份保留原文后重置为受管配置（可从 .bak 恢复）
+        std::fs::write(home.join("config.toml"), "<<<not toml>>>").unwrap();
+        apply_managed_gateway_to_config(home, "C:\\x\\codex-plus-credential.exe").unwrap();
+        let text = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(text.contains("[model_providers.managed_gateway]"));
+        assert!(std::fs::read_to_string(
+            home.join("config.toml.managed-gateway-bak")
+        )
+        .unwrap()
+        .contains("<<<not toml>>"));
+    }
+
+    #[test]
+    fn detects_and_removes_external_catalog_pointer_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let catalog = dir.path().join("external-catalog.json");
+        std::fs::write(&catalog, "[]").unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "model_catalog_json = \"C:\\\\tmp\\\\external-catalog.json\"\nmodel = \"gpt-5.2\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            managed_gateway_config_conflicts(home).as_deref(),
+            Some("C:\\tmp\\external-catalog.json")
+        );
+        let backup = remove_external_model_catalog_pointer(home).unwrap().unwrap();
+        assert!(std::path::Path::new(&backup).exists());
+        let text = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(!text.contains("model_catalog_json"));
+        assert!(text.contains("model = \"gpt-5.2\""));
+        assert!(catalog.exists());
+    }
+
+    #[test]
+    fn no_conflict_returns_none_and_removal_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::write(home.join("config.toml"), "model = \"gpt-5.2\"\n").unwrap();
+        assert!(managed_gateway_config_conflicts(home).is_none());
+        assert!(remove_external_model_catalog_pointer(home).unwrap().is_none());
     }
 }
