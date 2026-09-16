@@ -167,6 +167,67 @@ pub fn inject_managed_pac_arg(args: &[String], helper_port: u16) -> Vec<String> 
 
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayKeyCheck {
+    Ok,
+    Unauthorized,
+    ServerError,
+    TimeoutOrNetwork,
+}
+
+/// 验证网关 Key（固定网关地址）。不记录 Authorization 请求头。
+pub async fn verify_gateway_key(key: &str) -> GatewayKeyCheck {
+    verify_gateway_key_with_base(key, MANAGED_GATEWAY_BASE_URL).await
+}
+
+/// 带自定义 base_url 的验证入口（供测试注入 mock 网关）。
+pub async fn verify_gateway_key_with_base(key: &str, base_url: &str) -> GatewayKeyCheck {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return GatewayKeyCheck::TimeoutOrNetwork,
+    };
+    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let response = client.get(&url).bearer_auth(key).send().await;
+    let response = match response {
+        Ok(response) => response,
+        Err(_) => return GatewayKeyCheck::TimeoutOrNetwork,
+    };
+    match response.status().as_u16() {
+        200..=299 => GatewayKeyCheck::Ok,
+        401 | 403 => GatewayKeyCheck::Unauthorized,
+        500..=599 => GatewayKeyCheck::ServerError,
+        _ => GatewayKeyCheck::TimeoutOrNetwork,
+    }
+}
+
+/// 网关凭据是否已写入 Credential Manager。
+pub fn managed_gateway_credential_exists() -> bool {
+    crate::credential::read_credential(MANAGED_GATEWAY_CREDENTIAL_TARGET)
+        .map(|value| value.is_some())
+        .unwrap_or(false)
+}
+
+/// trim + 空拒绝 + 写入 Credential Manager。
+pub fn save_gateway_credential(key: &str) -> anyhow::Result<()> {
+    let key = key.trim();
+    if key.is_empty() {
+        anyhow::bail!("API Key 不能为空");
+    }
+    crate::credential::write_credential(MANAGED_GATEWAY_CREDENTIAL_TARGET, key)
+}
+
+/// 凭据读取命令的规范化绝对路径：当前 exe 同目录下的 codex-plus-credential.exe。
+pub fn managed_gateway_credential_command() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("codex-plus-credential.exe")))
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "codex-plus-credential.exe".to_string())
+}
+
 /// 受管 provider 在 config.toml 中的固定标识。
 pub const MANAGED_GATEWAY_PROVIDER_ID: &str = "managed_gateway";
 /// 凭据在 Windows Credential Manager 中的固定 target。
@@ -467,5 +528,64 @@ mod tests {
         std::fs::write(home.join("config.toml"), "model = \"gpt-5.2\"\n").unwrap();
         assert!(managed_gateway_config_conflicts(home).is_none());
         assert!(remove_external_model_catalog_pointer(home).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn gateway_key_check_maps_200_to_ok() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            verify_gateway_key_with_base("sk-test", &server.uri()).await,
+            GatewayKeyCheck::Ok
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_key_check_maps_401_and_403_to_unauthorized() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for status in [401, 403] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/models"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            assert_eq!(
+                verify_gateway_key_with_base("sk-bad", &server.uri()).await,
+                GatewayKeyCheck::Unauthorized
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_key_check_maps_5xx_to_server_error_and_dead_host_to_network() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/models"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            verify_gateway_key_with_base("sk-x", &server.uri()).await,
+            GatewayKeyCheck::ServerError
+        );
+        // 不可达地址（保留端口）映射为 TimeoutOrNetwork，不会误判为 Key 无效
+        assert_eq!(
+            verify_gateway_key_with_base("sk-x", "http://127.0.0.1:9").await,
+            GatewayKeyCheck::TimeoutOrNetwork
+        );
+    }
+
+    #[test]
+    fn save_gateway_credential_rejects_blank_key() {
+        assert!(save_gateway_credential("   ").is_err());
+        assert!(save_gateway_credential("").is_err());
     }
 }
