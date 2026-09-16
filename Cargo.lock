@@ -447,6 +447,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-plus-credential"
+version = "1.3.0"
+dependencies = [
+ "codex-plus-core",
+]
+
+[[package]]
 name = "codex-plus-data"
 version = "1.3.0"
 dependencies = [
