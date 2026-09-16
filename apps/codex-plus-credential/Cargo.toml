@@ -1,0 +1,9 @@
+[package]
+name = "codex-plus-credential"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+codex-plus-core = { path = "../../crates/codex-plus-core" }
