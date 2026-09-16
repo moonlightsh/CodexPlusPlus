@@ -1546,6 +1546,7 @@ impl LaunchHooks for ContextHooks {
         &self,
         _app_dir: &std::path::Path,
         _debug_port: u16,
+        _helper_port: u16,
         _settings: &BackendSettings,
         _extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {

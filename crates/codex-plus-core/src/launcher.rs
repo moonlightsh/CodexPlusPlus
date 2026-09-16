@@ -192,6 +192,7 @@ pub trait LaunchHooks: Send + Sync {
         &self,
         app_dir: &Path,
         debug_port: u16,
+        helper_port: u16,
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch>;
@@ -492,7 +493,13 @@ where
         }
 
         let launch = hooks
-            .launch_codex(&app_dir, debug_port, &settings, &settings.codex_extra_args)
+            .launch_codex(
+                &app_dir,
+                debug_port,
+                helper_port,
+                &settings,
+                &settings.codex_extra_args,
+            )
             .await?;
         launched = Some(launch.clone());
         keep_launched_on_error = true;
@@ -858,13 +865,22 @@ impl LaunchHooks for DefaultLaunchHooks {
         &self,
         app_dir: &Path,
         debug_port: u16,
+        helper_port: u16,
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
         let native_menu_localization_enabled = settings.codex_app_native_menu_localization;
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
-        let launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
+        let mut launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
+        // 受管网关开启时，Windows packaged activation 追加唯一受管 PAC 参数，
+        // 并清理用户自带的 --proxy-pac-url / --proxy-server 冲突参数。
+        if cfg!(windows) && settings.windows_managed_gateway_enabled {
+            launch_extra_args = crate::managed_gateway::inject_managed_pac_arg(
+                &launch_extra_args,
+                helper_port,
+            );
+        }
         if cfg!(windows) {
             let activation = if let Some(inspector_port) = native_menu_inspector_port {
                 build_packaged_activation_with_native_menu_inspector(
@@ -1200,6 +1216,37 @@ async fn handle_helper_connection(
             "body_bytes": request.body.len()
         }),
     );
+
+    if crate::managed_gateway::is_proxy_pac_path(path) && method == "GET" {
+        let body = crate::managed_gateway::build_pac_script();
+        write_http_response(
+            &mut stream,
+            "200 OK",
+            "application/x-ns-proxy-autoconfig",
+            body.as_bytes(),
+        )
+        .await?;
+        log_helper_response(
+            "helper.managed_proxy_pac_ok",
+            method,
+            path,
+            "200 OK",
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
+    if crate::managed_gateway::is_proxy_pac_path(path) && method == "OPTIONS" {
+        write_http_response(
+            &mut stream,
+            "204 No Content",
+            "application/x-ns-proxy-autoconfig",
+            &[],
+        )
+        .await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
 
     if crate::protocol_proxy::is_audio_transcriptions_proxy_path(path) && method == "POST" {
         return handle_audio_transcriptions_proxy_connection(
@@ -3518,6 +3565,39 @@ mod tests {
         let response = send_raw_helper_request(&request).await;
 
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn helper_serves_managed_proxy_pac_with_fixed_content() {
+        let response = send_raw_helper_request(
+            b"GET /proxy.pac HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("application/x-ns-proxy-autoconfig"));
+        assert!(response.contains("FindProxyForURL"));
+        assert!(response.contains("SOCKS5 10.20.30.61:7891"));
+        // 命中结果不追加 DIRECT 回退（避免 SOCKS5 不可用时静默直连）
+        assert!(!response.contains("; DIRECT"));
+    }
+
+    #[test]
+    fn packaged_activation_includes_unique_managed_pac_arg_when_enabled() {
+        let args = crate::managed_gateway::inject_managed_pac_arg(
+            &["--proxy-server=socks5://evil:1".to_string()],
+            57321,
+        );
+        let arguments = command_line_arguments(&build_codex_arguments(9229, &args));
+        assert!(arguments.contains("--proxy-pac-url=http://127.0.0.1:57321/proxy.pac"));
+        assert!(!arguments.contains("--proxy-server"));
+        assert_eq!(
+            arguments
+                .matches("--proxy-pac-url=")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

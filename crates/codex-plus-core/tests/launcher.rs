@@ -2352,10 +2352,12 @@ impl LaunchHooks for FakeHooks {
         &self,
         app_dir: &Path,
         debug_port: u16,
+        helper_port: u16,
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
         assert!(app_dir.ends_with("Codex.app"));
+        self.event(format!("launch-helper-port:{helper_port}"));
         let launch_detail = if extra_args.is_empty() {
             format!("launch:{debug_port}")
         } else {
