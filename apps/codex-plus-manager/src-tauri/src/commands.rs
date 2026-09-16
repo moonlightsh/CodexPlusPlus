@@ -6285,6 +6285,114 @@ fn failed<T: Serialize>(message: &str, payload: T) -> CommandResult<T> {
     }
 }
 
+/// Windows 受管模型网关的状态：是否启用、凭据是否已配置、外部 catalog 冲突。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManagedGatewayStatusPayload {
+    pub enabled: bool,
+    pub credential_configured: bool,
+    pub external_catalog_conflict: Option<String>,
+}
+
+fn empty_managed_gateway_status() -> ManagedGatewayStatusPayload {
+    ManagedGatewayStatusPayload {
+        enabled: false,
+        credential_configured: false,
+        external_catalog_conflict: None,
+    }
+}
+
+#[tauri::command]
+pub fn managed_gateway_status() -> CommandResult<ManagedGatewayStatusPayload> {
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    ok(
+        "受管网关状态已加载。",
+        ManagedGatewayStatusPayload {
+            enabled: settings.windows_managed_gateway_enabled,
+            credential_configured:
+                codex_plus_core::managed_gateway::managed_gateway_credential_exists(),
+            external_catalog_conflict:
+                codex_plus_core::managed_gateway::managed_gateway_config_conflicts(&home),
+        },
+    )
+}
+
+/// 验证并保存网关 API Key：trim 校验 → 网关验证（区分失败类别）→ 写入凭据 →
+/// 启用时移除外部 catalog 指针（备份）→ 更新设置。明文 Key 用后即清，不进日志。
+#[tauri::command]
+pub async fn save_managed_gateway_key(
+    api_key: String,
+    enabled: bool,
+) -> CommandResult<ManagedGatewayStatusPayload> {
+    let key = api_key.trim().to_string();
+    if key.is_empty() {
+        return failed("API Key 不能为空。", empty_managed_gateway_status());
+    }
+    let check = codex_plus_core::managed_gateway::verify_gateway_key(&key).await;
+    match check {
+        codex_plus_core::managed_gateway::GatewayKeyCheck::Ok => {}
+        codex_plus_core::managed_gateway::GatewayKeyCheck::Unauthorized => {
+            return failed(
+                "网关拒绝了该 API Key（401/403），请确认后重试。",
+                empty_managed_gateway_status(),
+            );
+        }
+        codex_plus_core::managed_gateway::GatewayKeyCheck::ServerError => {
+            return failed(
+                "网关服务异常（5xx），凭据未修改，请稍后重试。",
+                empty_managed_gateway_status(),
+            );
+        }
+        codex_plus_core::managed_gateway::GatewayKeyCheck::TimeoutOrNetwork => {
+            return failed(
+                "无法连接网关，请检查网络后重试。",
+                empty_managed_gateway_status(),
+            );
+        }
+    }
+    if let Err(error) = codex_plus_core::managed_gateway::save_gateway_credential(&key) {
+        return failed(
+            &format!("保存凭据失败：{error}"),
+            empty_managed_gateway_status(),
+        );
+    }
+    if enabled {
+        let home = codex_plus_core::relay_config::default_codex_home_dir();
+        if let Err(error) =
+            codex_plus_core::managed_gateway::remove_external_model_catalog_pointer(&home)
+        {
+            return failed(
+                &format!("移除外部 model_catalog_json 指针失败：{error}"),
+                empty_managed_gateway_status(),
+            );
+        }
+        let mut settings = SettingsStore::default().load().unwrap_or_default();
+        settings.windows_managed_gateway_enabled = true;
+        if let Err(error) = SettingsStore::default().save(&settings) {
+            return failed(
+                &format!("保存设置失败：{error}"),
+                empty_managed_gateway_status(),
+            );
+        }
+    }
+    drop(key);
+    managed_gateway_status()
+}
+
+#[tauri::command]
+pub fn set_managed_gateway_enabled(enabled: bool) -> CommandResult<ManagedGatewayStatusPayload> {
+    let mut settings = SettingsStore::default().load().unwrap_or_default();
+    settings.windows_managed_gateway_enabled = enabled;
+    if let Err(error) = SettingsStore::default().save(&settings) {
+        return failed(
+            &format!("保存设置失败：{error}"),
+            empty_managed_gateway_status(),
+        );
+    }
+    managed_gateway_status()
+}
+
 /// provider sync 正在进行时，最多等它这么久再考虑放弃重启。
 const PROVIDER_SYNC_WAIT_TIMEOUT_MS: u64 = 30_000;
 const PROVIDER_SYNC_WAIT_INTERVAL_MS: u64 = 200;
