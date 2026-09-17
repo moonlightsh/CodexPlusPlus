@@ -34,6 +34,8 @@ export const EN_PLAIN: Record<string, string> = {
   "API Key": "API Key",
   "API Key 不能为空。": "API Key must not be empty.",
   "API Key 已配置。": "API Key configured.",
+  "分流代理端口": "Split-routing proxy port",
+  "受管模式下请从本工具启动 Codex：分流代理随本工具运行，否则模型请求会因代理未监听而失败。": "In managed mode, launch Codex from this tool: the split-routing proxy runs with it, otherwise model requests fail because nothing is listening on the proxy port.",
   "API Key 未配置。": "API Key not configured.",
   "验证并保存": "Verify and save",
   "重新录入 API Key": "Re-enter API Key",

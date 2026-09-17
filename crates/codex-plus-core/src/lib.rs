@@ -21,6 +21,8 @@ pub mod grok_config;
 pub mod http_client;
 pub mod install;
 pub mod launcher;
+pub mod managed_env;
+pub mod managed_proxy;
 pub mod managed_gateway;
 pub mod manager_navigation;
 pub mod credential;

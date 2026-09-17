@@ -483,6 +483,7 @@ type ManagedGatewayStatusResult = CommandResult<{
   enabled: boolean;
   credentialConfigured: boolean;
   externalCatalogConflict: string | null;
+  proxyPort: number;
 }>;
 
 type WeixinQrResult = CommandResult<{
@@ -7574,6 +7575,7 @@ function ManagedGatewayPanel({
   const enabled = form.windowsManagedGatewayEnabled;
   const credentialConfigured = status?.credentialConfigured ?? false;
   const conflict = status?.externalCatalogConflict ?? null;
+  const proxyPort = status?.proxyPort ?? 0;
   const saveKey = async () => {
     const key = apiKeyInput.trim();
     if (!key) {
@@ -7611,6 +7613,15 @@ function ManagedGatewayPanel({
             </label>
             <p className="field-hint">
               {credentialConfigured ? t("API Key 已配置。") : t("API Key 未配置。")}
+            </p>
+            {proxyPort > 0 ? (
+              <p className="field-hint">
+                {t("分流代理端口")}
+                {`: 127.0.0.1:${proxyPort}`}
+              </p>
+            ) : null}
+            <p className="field-hint">
+              {t("受管模式下请从本工具启动 Codex：分流代理随本工具运行，否则模型请求会因代理未监听而失败。")}
             </p>
             {conflict ? (
               <p className="field-hint">

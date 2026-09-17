@@ -6292,6 +6292,8 @@ pub struct ManagedGatewayStatusPayload {
     pub enabled: bool,
     pub credential_configured: bool,
     pub external_catalog_conflict: Option<String>,
+    /// 受管分流代理的回环端口，供面板展示与排障。
+    pub proxy_port: u16,
 }
 
 fn empty_managed_gateway_status() -> ManagedGatewayStatusPayload {
@@ -6299,6 +6301,7 @@ fn empty_managed_gateway_status() -> ManagedGatewayStatusPayload {
         enabled: false,
         credential_configured: false,
         external_catalog_conflict: None,
+        proxy_port: codex_plus_core::managed_proxy::managed_proxy_port(),
     }
 }
 
@@ -6314,6 +6317,7 @@ pub fn managed_gateway_status() -> CommandResult<ManagedGatewayStatusPayload> {
                 codex_plus_core::managed_gateway::managed_gateway_credential_exists(),
             external_catalog_conflict:
                 codex_plus_core::managed_gateway::managed_gateway_config_conflicts(&home),
+            proxy_port: codex_plus_core::managed_proxy::managed_proxy_port(),
         },
     )
 }
@@ -6390,7 +6394,36 @@ pub fn set_managed_gateway_enabled(enabled: bool) -> CommandResult<ManagedGatewa
             empty_managed_gateway_status(),
         );
     }
+    // 关闭时立即摸掉 `.env` 里的代理块：否则它会指向一个不再启动的本地端口，
+    // 让 codex 引擎的所有请求失败。
+    if !enabled
+        && let Err(error) = clear_managed_env_block()
+    {
+        return failed(
+            &format!("清理 .env 代理配置失败：{error}"),
+            empty_managed_gateway_status(),
+        );
+    }
     managed_gateway_status()
+}
+
+/// 从 `~/.codex/.env` 移除受管块，保留用户自己的行。块不存在时为空操作。
+fn clear_managed_env_block() -> anyhow::Result<()> {
+    let home = codex_plus_core::relay_config::default_codex_home_dir();
+    let path = codex_plus_core::managed_env::managed_env_file_path(&home);
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let updated = codex_plus_core::managed_env::remove_managed_env_block(&existing);
+    if updated == existing {
+        return Ok(());
+    }
+    if updated.trim().is_empty() {
+        std::fs::remove_file(&path)?;
+    } else {
+        std::fs::write(&path, updated)?;
+    }
+    Ok(())
 }
 
 /// provider sync 正在进行时，最多等它这么久再考虑放弃重启。

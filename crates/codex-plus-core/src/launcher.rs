@@ -722,9 +722,46 @@ pub(crate) async fn default_ensure_managed_gateway_ready(
         anyhow::bail!("未配置模型网关 API Key，已打开管理工具初始化页");
     }
     mg::apply_managed_gateway_to_config(home, &mg::managed_gateway_credential_command())?;
+    // 先启代理再写 `.env`：避免 `.env` 指向一个没人监听的端口。
+    let proxy_port = crate::managed_proxy::ensure_managed_proxy_running().await?;
+    verify_managed_proxy_self_check(proxy_port).await?;
+    write_managed_env_file(home, proxy_port)?;
     verify_managed_pac_endpoint(helper_port).await?;
     verify_tcp_connectivity("10.20.30.61", mg::MANAGED_GATEWAY_SOCKS5_PORT).await?;
     verify_tcp_connectivity("10.20.30.61", 8080).await?;
+    Ok(())
+}
+
+/// 代理自测：确认监听已生效且端口上的确实是本工具的受管代理。
+///
+/// 不去真实拨 SOCKS5：上游可达性由后面的 TCP 检查负责，避免启动路径上多一次对外握手。
+async fn verify_managed_proxy_self_check(proxy_port: u16) -> anyhow::Result<()> {
+    if crate::managed_proxy::probe_existing_managed_proxy(proxy_port).await {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.managed_proxy_ready",
+            serde_json::json!({ "proxy_port": proxy_port }),
+        );
+        return Ok(());
+    }
+    anyhow::bail!("受管代理自测失败：127.0.0.1:{proxy_port} 未应答自识端点");
+}
+
+/// 写入 `~/.codex/.env` 的受管块。幂等，且保留用户其他行。
+fn write_managed_env_file(home: &Path, proxy_port: u16) -> anyhow::Result<()> {
+    let path = crate::managed_env::managed_env_file_path(home);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = crate::managed_env::upsert_managed_env_block(&existing, proxy_port);
+    if updated == existing {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, updated)?;
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.managed_env_written",
+        serde_json::json!({ "proxy_port": proxy_port }),
+    );
     Ok(())
 }
 
