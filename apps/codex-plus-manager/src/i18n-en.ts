@@ -31,6 +31,8 @@ export const EN_PLAIN: Record<string, string> = {
   "受管模型网关": "Managed model gateway",
   "仅 Windows 可用。启用后，模型请求将固定发送到内置模型网关，OpenAI 相关域名将固定通过内置 SOCKS5 代理访问；网关、代理与规则不可修改。": "Available on Windows only. Once enabled, model requests are pinned to the built-in gateway, and OpenAI domains go through the built-in SOCKS5 proxy. Gateway, proxy and rules cannot be modified.",
   "启用受管网关": "Enable managed gateway",
+  "API Key": "API Key",
+  "API Key 不能为空。": "API Key must not be empty.",
   "API Key 已配置。": "API Key configured.",
   "API Key 未配置。": "API Key not configured.",
   "验证并保存": "Verify and save",
