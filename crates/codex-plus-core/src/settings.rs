@@ -412,6 +412,9 @@ pub struct BackendSettings {
     pub provider_sync_last_selected_provider: String,
     #[serde(rename = "ccsDbPath", default)]
     pub ccs_db_path: String,
+    /// Windows 受管模型网关（固定网关 + SOCKS5 PAC 分流）。仅 Windows 生效，默认关闭。
+    #[serde(rename = "windowsManagedGatewayEnabled", default)]
+    pub windows_managed_gateway_enabled: bool,
     #[serde(rename = "relayProfilesEnabled", default = "default_true")]
     pub relay_profiles_enabled: bool,
     #[serde(rename = "enhancementsEnabled", default = "default_true")]
@@ -607,6 +610,7 @@ impl Default for BackendSettings {
             provider_sync_manual_providers: Vec::new(),
             provider_sync_last_selected_provider: String::new(),
             ccs_db_path: String::new(),
+            windows_managed_gateway_enabled: false,
             relay_profiles_enabled: true,
             enhancements_enabled: true,
             codex_app_plugin_marketplace_unlock: true,
@@ -1258,6 +1262,15 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     target.remove("computerUseGuardEnabled");
     if let Some(value) = source.get("codexAppPath").and_then(Value::as_str) {
         target.insert("codexAppPath".to_string(), Value::String(value.to_string()));
+    }
+    if let Some(value) = source
+        .get("windowsManagedGatewayEnabled")
+        .and_then(Value::as_bool)
+    {
+        target.insert(
+            "windowsManagedGatewayEnabled".to_string(),
+            Value::Bool(value),
+        );
     }
     if let Some(value) = source.get("codexExtraArgs").and_then(Value::as_array) {
         let args = value
@@ -2531,6 +2544,7 @@ experimental_bearer_token = "sk-existing""#
         let store = SettingsStore::new(dir.join("settings.json"));
 
         assert_eq!(store.load().unwrap(), normalized_default_settings());
+        assert!(!store.load().unwrap().windows_managed_gateway_enabled);
     }
 
     #[test]

@@ -249,6 +249,7 @@ type BackendSettings = {
   codexAppPasteFix: boolean;
   codexAppForceChineseLocale: boolean;
   codexAppFastStartup: boolean;
+  windowsManagedGatewayEnabled: boolean;
   codexAppThreadIdBadge: boolean;
   codexAppConversationView: boolean;
   codexAppThreadScrollRestore: boolean;
@@ -476,6 +477,13 @@ type WeixinConnectStatusResult = CommandResult<{
   lastPeerId: string;
   lastMessageAtMs: number;
   processedMessages: number;
+}>;
+
+type ManagedGatewayStatusResult = CommandResult<{
+  enabled: boolean;
+  credentialConfigured: boolean;
+  externalCatalogConflict: string | null;
+  proxyPort: number;
 }>;
 
 type WeixinQrResult = CommandResult<{
@@ -932,7 +940,7 @@ type StartupResult = CommandResult<{
 
 type ManagerNavigationIntent = {
   page: "settings";
-  section?: "stepwise";
+  section?: "stepwise" | "managedGateway";
 };
 
 /** 顶栏工具切换条的工具标识。后端 `list_tools` 返回同名字符串。 */
@@ -949,6 +957,7 @@ type Theme = "dark" | "light";
 
 const MANAGER_NAVIGATION_EVENT = "manager-navigation-requested";
 const SETTINGS_STEPWISE_SECTION_ID = "settings-stepwise";
+const SETTINGS_MANAGED_GATEWAY_SECTION_ID = "settings-managed-gateway";
 
 /**
  * 导航项归属。
@@ -1010,6 +1019,7 @@ const defaultSettings: BackendSettings = {
   codexAppPasteFix: false,
   codexAppForceChineseLocale: true,
   codexAppFastStartup: false,
+  windowsManagedGatewayEnabled: false,
   codexAppThreadIdBadge: false,
   codexAppConversationView: false,
   codexAppThreadScrollRestore: true,
@@ -1290,6 +1300,45 @@ export function App() {
     if (result) {
       setWeixinStatus(result);
       if (!silent) showResultNotice(t("微信连接"), result, { silentSuccess: true });
+    }
+    return result;
+  };
+
+  const [managedGatewayStatus, setManagedGatewayStatus] = useState<ManagedGatewayStatusResult | null>(null);
+  const refreshManagedGatewayStatus = async (silent = true) => {
+    const result = await run(() => call<ManagedGatewayStatusResult>("managed_gateway_status"));
+    if (result) {
+      setManagedGatewayStatus(result);
+      if (!silent) showResultNotice(t("受管模型网关"), result, { silentSuccess: true });
+    }
+    return result;
+  };
+
+  const saveManagedGatewayKey = async (apiKey: string, enabled: boolean) => {
+    const result = await run(() =>
+      call<ManagedGatewayStatusResult>("save_managed_gateway_key", { apiKey, enabled }),
+    );
+    if (result && result.status === "ok") {
+      setManagedGatewayStatus(result);
+      showResultNotice(t("受管模型网关"), result, {});
+      if (result.enabled) {
+        const normalized = { ...settingsForm, windowsManagedGatewayEnabled: true };
+        setSettingsForm(normalized);
+      }
+    } else if (result) {
+      showResultNotice(t("受管模型网关"), result, {});
+    }
+    return result;
+  };
+
+  const setManagedGatewayEnabled = async (enabled: boolean) => {
+    const result = await run(() =>
+      call<ManagedGatewayStatusResult>("set_managed_gateway_enabled", { enabled }),
+    );
+    if (result) {
+      setManagedGatewayStatus(result);
+      const normalized = { ...settingsForm, windowsManagedGatewayEnabled: enabled };
+      setSettingsForm(normalized);
     }
     return result;
   };
@@ -3067,6 +3116,24 @@ export function App() {
   }, [pendingSettingsSection, route]);
 
   useEffect(() => {
+    if (route !== "settings" || pendingSettingsSection !== "managedGateway") return;
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        document.getElementById(SETTINGS_MANAGED_GATEWAY_SECTION_ID)?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+        setPendingSettingsSection(null);
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      if (secondFrame) window.cancelAnimationFrame(secondFrame);
+    };
+  }, [pendingSettingsSection, route]);
+
+  useEffect(() => {
     if (getLanguage() === "en") {
       void invoke("update_tray_labels", {
         showLabel: "Show window",
@@ -3382,6 +3449,9 @@ export function App() {
       testRelayProfile,
       diagnoseRelayProfile,
       testStepwiseSettings,
+      refreshManagedGatewayStatus,
+      saveManagedGatewayKey,
+      setManagedGatewayEnabled,
       fetchRelayProfileModels,
       fetchSub2ApiBilling,
       switchRelayProfile,
@@ -3643,6 +3713,7 @@ export function App() {
               toolEntries={toolEntries}
               onFormChange={setSettingsForm}
               actions={actions}
+              managedGateway={managedGatewayStatus}
             />
           ) : null}
         </section>
@@ -3757,6 +3828,9 @@ type Actions = {
   deleteDreamSkinTheme: (item: DreamSkinThemeSummary) => Promise<void>;
   activateDreamSkinTheme: () => Promise<void>;
   refreshDreamSkinStatus: (silent?: boolean) => Promise<DreamSkinRuntimeResult | null>;
+  refreshManagedGatewayStatus: (silent?: boolean) => Promise<ManagedGatewayStatusResult | null>;
+  saveManagedGatewayKey: (apiKey: string, enabled: boolean) => Promise<ManagedGatewayStatusResult | null>;
+  setManagedGatewayEnabled: (enabled: boolean) => Promise<ManagedGatewayStatusResult | null>;
   restoreDreamSkin: () => Promise<void>;
   verifyDreamSkin: () => Promise<void>;
   saveDreamSkinScreenshot: () => Promise<void>;
@@ -5072,12 +5146,12 @@ function DreamSkinScreen({
               <Badge status={status?.liveApplied ? "ok" : status?.paused ? "disabled" : "not_checked"} />
             </div>
           </div>
-          {!masterEnabled ? (
+          {masterEnabled ? null : (
             <div className="hint-line">
               <Info className="h-4 w-4" />
               <span>{t("请先在 Codex增强 页面开启总开关。")}</span>
             </div>
-          ) : null}
+          )}
           <Toolbar>
             <Button disabled={!masterEnabled || !draft} onClick={() => void actions.activateDreamSkinTheme()} title={t("保存并应用主题；需要重启时只会标记为待应用")}>
               <Play className="h-4 w-4" />
@@ -5288,7 +5362,7 @@ function DreamSkinScreen({
                 );
               })}
             </div>
-            {!library ? <p className="empty">{t("正在加载主题库…")}</p> : null}
+            {library ? null : <p className="empty">{t("正在加载主题库…")}</p>}
           </section>
 
           <details className="dream-skin-customizer">
@@ -5732,13 +5806,13 @@ function DreamSkinCommunitySection({
         </div>
       ) : (
         <div className="empty">
-          {!community
-            ? t("正在加载 DreamSkin 社区…")
-            : community.status === "failed"
+          {community
+            ? community.status === "failed"
               ? community.message
               : query.trim()
                 ? t("没有匹配的社区主题。")
-                : t("DreamSkin 社区暂时没有可用主题。")}
+                : t("DreamSkin 社区暂时没有可用主题。")
+            : t("正在加载 DreamSkin 社区…")}
         </div>
       )}
     </section>
@@ -6254,9 +6328,9 @@ function SessionsScreen({
                 options={
                   providerTargets.length
                     ? [
-                        ...(!selectedProviderSyncTarget
-                          ? [{ value: "", label: t("当前配置 provider"), disabled: true }]
-                          : []),
+                        ...(selectedProviderSyncTarget
+                          ? []
+                          : [{ value: "", label: t("当前配置 provider"), disabled: true }]),
                         ...providerTargets.map((target) => ({
                           value: target.id,
                           label: `${target.id}${t("（")}${providerSyncTargetLabel(target)}${t("）")}`,
@@ -6687,6 +6761,7 @@ function SettingsScreen({
   toolEntries,
   onFormChange,
   actions,
+  managedGateway,
 }: {
   dirty: boolean;
   settings: SettingsResult | null;
@@ -6696,6 +6771,7 @@ function SettingsScreen({
   toolEntries: ToolEntry[];
   onFormChange: (value: BackendSettings) => void;
   actions: Actions;
+  managedGateway: ManagedGatewayStatusResult | null;
 }) {
   const tool = toolEntries.find((entry) => entry.id === activeTool);
   const isCodex = activeTool === "codex";
@@ -6731,6 +6807,13 @@ function SettingsScreen({
               </p>
             </CardContent>
           </Panel>
+
+          <ManagedGatewayPanel
+            form={form}
+            status={managedGateway}
+            onFormChange={onFormChange}
+            actions={actions}
+          />
 
           <Panel>
             <CardHead title="Stepwise" detail={t("控制下一步建议与回答大纲。")} />
@@ -7421,7 +7504,7 @@ function RelayProfileDetail({
             <Button
               disabled={!form.relayProfilesEnabled || actions.relaySwitching}
               onClick={switchDraft}
-              title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭") : actions.relaySwitching ? t("供应商切换中") : undefined}
+              title={form.relayProfilesEnabled ? actions.relaySwitching ? t("供应商切换中") : undefined : t("供应商配置总开关已关闭")}
               variant={draft.id === form.activeRelayId ? "secondary" : "default"}
             >
               {actions.relaySwitching ? t("切换中") : draft.id === form.activeRelayId ? t("使用中") : t("设为当前")}
@@ -7471,6 +7554,97 @@ function RelayProfileDetail({
         />
       ) : null}
     </div>
+  );
+}
+
+/// 受管模型网关面板：状态展示 + API Key 录入（初始化/重录）+ 启用开关。
+/// 地址、代理与规则均固定，不提供输入控件；UI 不回显已保存的完整 Key。
+function ManagedGatewayPanel({
+  form,
+  status,
+  onFormChange,
+  actions,
+}: {
+  form: BackendSettings;
+  status: ManagedGatewayStatusResult | null;
+  onFormChange: (value: BackendSettings) => void;
+  actions: Actions;
+}) {
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [saving, setSaving] = useState(false);
+  const enabled = form.windowsManagedGatewayEnabled;
+  const credentialConfigured = status?.credentialConfigured ?? false;
+  const conflict = status?.externalCatalogConflict ?? null;
+  const proxyPort = status?.proxyPort ?? 0;
+  const saveKey = async () => {
+    const key = apiKeyInput.trim();
+    if (!key) {
+      actions.showMessage(t("受管模型网关"), t("API Key 不能为空。"), "failed");
+      return;
+    }
+    setSaving(true);
+    try {
+      await actions.saveManagedGatewayKey(key, true);
+      setApiKeyInput("");
+    } finally {
+      setSaving(false);
+    }
+  };
+  return (
+    <Panel>
+      <div id={SETTINGS_MANAGED_GATEWAY_SECTION_ID}>
+        <CardHead
+          title={t("受管模型网关（Windows）")}
+          detail={t("仅 Windows 可用。启用后，模型请求将固定发送到内置模型网关，OpenAI 相关域名将固定通过内置 SOCKS5 代理访问；网关、代理与规则不可修改。")}
+        />
+        <CardContent className="settings-content">
+          <div className="settings-block">
+            <label className="check-row">
+              <input
+                type="checkbox"
+                checked={enabled}
+                onChange={(event) => {
+                  const next = { ...form, windowsManagedGatewayEnabled: event.currentTarget.checked };
+                  onFormChange(next);
+                  void actions.setManagedGatewayEnabled(event.currentTarget.checked);
+                }}
+              />
+              <span>{t("启用受管网关")}</span>
+            </label>
+            <p className="field-hint">
+              {credentialConfigured ? t("API Key 已配置。") : t("API Key 未配置。")}
+            </p>
+            {proxyPort > 0 ? (
+              <p className="field-hint">
+                {t("分流代理端口")}
+                {`: 127.0.0.1:${proxyPort}`}
+              </p>
+            ) : null}
+            <p className="field-hint">
+              {t("受管模式下请从本工具启动 Codex：分流代理随本工具运行，否则模型请求会因代理未监听而失败。")}
+            </p>
+            {conflict ? (
+              <p className="field-hint">
+                {t("检测到外部 model_catalog_json：初始化完成时会自动备份并移除该指针（外部文件保留）。")}
+              </p>
+            ) : null}
+            <Field label={t("API Key")}>
+              <Input
+                type="password"
+                value={apiKeyInput}
+                onChange={(event) => setApiKeyInput(event.currentTarget.value)}
+                placeholder={credentialConfigured ? t("重新录入 API Key") : t("API Key")}
+              />
+            </Field>
+            <div className="toolbar">
+              <Button disabled={saving} onClick={() => void saveKey()}>
+                {t("验证并保存")}
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </div>
+    </Panel>
   );
 }
 
@@ -7881,11 +8055,11 @@ function RelayProfileEditor({
                 ]}
               />
               <p className="field-hint">
-                {profile.protocol !== "responses"
-                  ? t("OpenAI 会话身份需要 Responses API；Chat Completions 不支持远程压缩。")
-                  : canUseOpenAiSessionProvider
+                {profile.protocol === "responses"
+                  ? canUseOpenAiSessionProvider
                     ? t("选择 OpenAI 后，Codex Remote 会把当前会话识别为 ChatGPT 会话；中转仍使用 custom 表。")
-                    : t("官方登录未混入 API 时不写入会话 provider")}
+                    : t("官方登录未混入 API 时不写入会话 provider")
+                  : t("OpenAI 会话身份需要 Responses API；Chat Completions 不支持远程压缩。")}
               </p>
             </Field>
             <Field className="relay-field-sub2api" label="Sub2API">
@@ -8413,7 +8587,7 @@ function VlmTestPanel({
     const text = [
       vlmTestTranslation(r.vlmStatus, r.httpCode ?? undefined, r.durationMs, tr),
       `model: ${r.model}`,
-      r.httpCode != null ? `HTTP ${r.httpCode}` : null,
+      r.httpCode == null ? null : `HTTP ${r.httpCode}`,
       r.error ? `error: ${r.error}` : null,
       r.rawRequest ? `--- request ---\n${r.rawRequest}` : null,
       r.rawResponse ? `--- response ---\n${r.rawResponse}` : null,
@@ -8477,11 +8651,11 @@ function VlmTestPanel({
           {done.description ? (
             <pre className="vlm-test-description">{done.description}</pre>
           ) : null}
-          {done.vlmStatus !== "ok" ? (
+          {done.vlmStatus === "ok" ? null : (
             <button className="vlm-test-detail-toggle" onClick={() => void copyError()} type="button">
               {t("复制错误")}
             </button>
-          ) : null}
+          )}
           <button
             className="vlm-test-detail-toggle"
             aria-expanded={showRaw}
@@ -8684,9 +8858,9 @@ function AggregateRelayProfileEditor({
                   options={routeTargetOptions}
                   value={route.profileId}
                 />
-                {!routeTargetOptions.some((option) => option.value === route.profileId) ? (
+                {routeTargetOptions.some((option) => option.value === route.profileId) ? null : (
                   <span className="aggregate-route-target-error">{t("路由目标必须是已勾选的聚合成员，请先在成员供应商中勾选。")}</span>
-                ) : null}
+                )}
                 <div className="aggregate-route-priority">
                   <span>{t("优先级")}</span>
                   <Input
@@ -9884,11 +10058,11 @@ function GrokScreen({
               disabled={!activeProfile || applying || draftDirty}
               onClick={() => setConfirming(true)}
               title={
-                !activeProfile
-                  ? t("请先选择一个供应商")
-                  : draftDirty
+                activeProfile
+                  ? draftDirty
                     ? t("请先保存当前修改")
                     : undefined
+                  : t("请先选择一个供应商")
               }
             >
               <Play className="h-4 w-4" />
@@ -10072,7 +10246,7 @@ function ToolSwitcher({
           >
             <Icon aria-hidden="true" className="tool-chip-icon" />
             <span className="tool-chip-name">{tool.name}</span>
-            {!tool.switchable ? <span className="tool-chip-note">{t("待接入")}</span> : null}
+            {tool.switchable ? null : <span className="tool-chip-note">{t("待接入")}</span>}
           </button>
         );
       })}
@@ -11119,7 +11293,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
   }
   const relayMode = normalizeRelayMode(profile.relayMode);
   const officialMixApiKey = profile.officialMixApiKey === true || legacyMixedApi;
-  let normalized: RelayProfile = {
+  const normalized: RelayProfile = {
     ...profile,
     model: profile.model || "",
     baseUrl: profile.baseUrl || defaultSettings.relayBaseUrl,
@@ -11587,7 +11761,7 @@ function tomlSectionName(line: string): string | null {
 }
 
 function tomlStringAssignmentValue(line: string, key: string): string | null {
-  const match = new RegExp(`^\\s*${key}\\s*=\\s*([\"'])(.*)\\1\\s*(?:#.*)?$`).exec(line.trim());
+  const match = new RegExp(`^\\s*${key}\\s*=\\s*(["'])(.*)\\1\\s*(?:#.*)?$`).exec(line.trim());
   if (!match) return null;
   return match[2].replace(/\\(["'\\])/g, "$1");
 }

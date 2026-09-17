@@ -56,6 +56,7 @@ jobs:
           New-Item -ItemType Directory -Force dist/windows/app | Out-Null
           Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
           Copy-Item target/release/codex-plus-plus-manager.exe dist/windows/app/
+          Copy-Item target/release/codex-plus-credential.exe dist/windows/app/
 
       - name: Build Windows installer
         shell: pwsh

@@ -228,6 +228,7 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         .launch_codex(
             &app_dir,
             options.debug_port,
+            options.helper_port,
             &settings,
             &settings.codex_extra_args,
         )
@@ -549,11 +550,12 @@ impl LaunchHooks for LauncherHooks {
         &self,
         app_dir: &Path,
         debug_port: u16,
+        helper_port: u16,
         settings: &codex_plus_core::settings::BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<codex_plus_core::launcher::CodexLaunch> {
         self.core
-            .launch_codex(app_dir, debug_port, settings, extra_args)
+            .launch_codex(app_dir, debug_port, helper_port, settings, extra_args)
             .await
     }
 

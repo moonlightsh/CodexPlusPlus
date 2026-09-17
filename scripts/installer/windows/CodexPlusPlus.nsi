@@ -35,6 +35,7 @@ Section "Install"
 
   File "${ROOT}\dist\windows\app\codex-plus-plus.exe"
   File "${ROOT}\dist\windows\app\codex-plus-plus-manager.exe"
+  File "${ROOT}\dist\windows\app\codex-plus-credential.exe"
 
   Delete "$DESKTOP\Codex++ 绠＄悊宸ュ叿.lnk"
   Delete "$SMPROGRAMS\Codex++\Codex++ 绠＄悊宸ュ叿.lnk"
@@ -62,6 +63,11 @@ Section "Uninstall"
   nsExec::ExecToLog 'taskkill /IM codex-plus-plus-manager.exe /F'
   Pop $0
 
+  ; 先摸掉 ~/.codex/.env 里的受管代理块，否则它会指向一个不再存在的本地端口，
+  ; 让 codex 引擎后继的请求全部失败。必须在删 exe 之前执行。
+  nsExec::ExecToLog '"$INSTDIR\codex-plus-credential.exe" clear-managed-env'
+  Pop $0
+
   Delete "$DESKTOP\Codex++.lnk"
   Delete "$DESKTOP\Codex++ 管理工具.lnk"
   Delete "$DESKTOP\Codex++ 绠＄悊宸ュ叿.lnk"
@@ -73,6 +79,7 @@ Section "Uninstall"
 
   Delete "$INSTDIR\codex-plus-plus.exe"
   Delete "$INSTDIR\codex-plus-plus-manager.exe"
+  Delete "$INSTDIR\codex-plus-credential.exe"
   Delete "$INSTDIR\uninstall.exe"
   RMDir "$INSTDIR"
 

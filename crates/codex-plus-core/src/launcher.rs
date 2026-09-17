@@ -187,11 +187,29 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+    /// 受管模型网关是否在本次启动生效（Windows-only + 设置开关）。
+    fn managed_gateway_enabled(&self, settings: &BackendSettings) -> bool {
+        cfg!(windows) && settings.windows_managed_gateway_enabled
+    }
+    /// 凭据缺失时打开管理工具初始化页；默认拉起伴生 manager 二进制。
+    async fn open_manager_for_initialization(&self) -> anyhow::Result<()> {
+        crate::install::open_or_activate_manager().map(|_| ())
+    }
+    /// 受管启动编排：凭据检查 → 配置校正 → PAC 自检 → TCP 连通性检查。
+    /// 任一环节失败都不启动 Codex。
+    async fn ensure_managed_gateway_ready(
+        &self,
+        home: &Path,
+        helper_port: u16,
+    ) -> anyhow::Result<()> {
+        default_ensure_managed_gateway_ready(home, helper_port).await
+    }
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
     async fn launch_codex(
         &self,
         app_dir: &Path,
         debug_port: u16,
+        helper_port: u16,
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch>;
@@ -466,11 +484,12 @@ where
         }
         let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
             || remote_control_provider_proxy_enabled(&settings);
+        let managed_gateway_active = hooks.managed_gateway_enabled(&settings);
         if protocol_proxy_enabled {
             hooks.ensure_active_protocol_proxy_config(&settings).await?;
             helper_port = crate::protocol_proxy::protocol_proxy_port();
         }
-        if settings.enhancements_enabled || protocol_proxy_enabled {
+        if settings.enhancements_enabled || protocol_proxy_enabled || managed_gateway_active {
             // macOS 重启时旧 launcher 的 socket 释放可能稍晚于进程退出。
             let bind_retry_timeout_ms =
                 helper_bind_retry_timeout_ms(protocol_proxy_enabled, cfg!(target_os = "macos"));
@@ -490,9 +509,18 @@ where
             })?;
             helper_started = true;
         }
+        if managed_gateway_active {
+            hooks.ensure_managed_gateway_ready(&home, helper_port).await?;
+        }
 
         let launch = hooks
-            .launch_codex(&app_dir, debug_port, &settings, &settings.codex_extra_args)
+            .launch_codex(
+                &app_dir,
+                debug_port,
+                helper_port,
+                &settings,
+                &settings.codex_extra_args,
+            )
             .await?;
         launched = Some(launch.clone());
         keep_launched_on_error = true;
@@ -556,11 +584,10 @@ where
             if helper_started {
                 hooks.shutdown_helper(helper_port).await;
             }
-            if let Some(launch) = &launched {
-                if !keep_launched_on_error {
+            if let Some(launch) = &launched
+                && !keep_launched_on_error {
                     hooks.terminate_codex(launch).await;
                 }
-            }
             let message = error.to_string();
             let failure = launch_status("failed", &message, debug_port, helper_port, &app_dir);
             let _ = status_store.save_latest(&failure);
@@ -673,6 +700,112 @@ fn helper_bind_host() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+/// 默认受管启动编排实现（供 LaunchHooks 默认与测试复用）。
+pub(crate) async fn default_ensure_managed_gateway_ready(
+    home: &Path,
+    helper_port: u16,
+) -> anyhow::Result<()> {
+    use crate::managed_gateway as mg;
+    if !mg::managed_gateway_credential_exists() {
+        let _ = crate::manager_navigation::save_pending_manager_navigation(
+            &crate::manager_navigation::ManagerNavigationIntent {
+                page: "settings".to_string(),
+                section: Some("managedGateway".to_string()),
+            },
+        );
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.managed_gateway_credential_missing",
+            serde_json::json!({ "helper_port": helper_port }),
+        );
+        anyhow::bail!("未配置模型网关 API Key，已打开管理工具初始化页");
+    }
+    mg::apply_managed_gateway_to_config(home, &mg::managed_gateway_credential_command())?;
+    // 先启代理再写 `.env`：避免 `.env` 指向一个没人监听的端口。
+    let proxy_port = crate::managed_proxy::ensure_managed_proxy_running().await?;
+    verify_managed_proxy_self_check(proxy_port).await?;
+    write_managed_env_file(home, proxy_port)?;
+    verify_managed_pac_endpoint(helper_port).await?;
+    verify_tcp_connectivity("10.20.30.61", mg::MANAGED_GATEWAY_SOCKS5_PORT).await?;
+    verify_tcp_connectivity("10.20.30.61", 8080).await?;
+    Ok(())
+}
+
+/// 代理自测：确认监听已生效且端口上的确实是本工具的受管代理。
+///
+/// 不去真实拨 SOCKS5：上游可达性由后面的 TCP 检查负责，避免启动路径上多一次对外握手。
+async fn verify_managed_proxy_self_check(proxy_port: u16) -> anyhow::Result<()> {
+    if crate::managed_proxy::probe_existing_managed_proxy(proxy_port).await {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.managed_proxy_ready",
+            serde_json::json!({ "proxy_port": proxy_port }),
+        );
+        return Ok(());
+    }
+    anyhow::bail!("受管代理自测失败：127.0.0.1:{proxy_port} 未应答自识端点");
+}
+
+/// 写入 `~/.codex/.env` 的受管块。幂等，且保留用户其他行。
+fn write_managed_env_file(home: &Path, proxy_port: u16) -> anyhow::Result<()> {
+    let path = crate::managed_env::managed_env_file_path(home);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let updated = crate::managed_env::upsert_managed_env_block(&existing, proxy_port);
+    if updated == existing {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, updated)?;
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.managed_env_written",
+        serde_json::json!({ "proxy_port": proxy_port }),
+    );
+    Ok(())
+}
+
+/// PAC 自检：状态码、内容类型、核心代理结果。失败则不启动 Codex。
+async fn verify_managed_pac_endpoint(helper_port: u16) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+    let response = client
+        .get(format!("http://127.0.0.1:{helper_port}/proxy.pac"))
+        .send()
+        .await
+        .map_err(|error| anyhow::anyhow!("PAC 自检请求失败：{error}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("PAC 自检失败：状态码 {}", response.status());
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !content_type.contains("application/x-ns-proxy-autoconfig") {
+        anyhow::bail!("PAC 自检失败：内容类型不是 {content_type}");
+    }
+    let body = response
+        .text()
+        .await
+        .map_err(|error| anyhow::anyhow!("PAC 自检读取失败：{error}"))?;
+    if !body.contains(crate::managed_gateway::MANAGED_GATEWAY_SOCKS5_RESULT) {
+        anyhow::bail!("PAC 自检失败：缺少 SOCKS5 结果");
+    }
+    Ok(())
+}
+
+/// TCP 连通性检查：只用于给出明确错误，不代表业务请求验证成功。
+async fn verify_tcp_connectivity(host: &str, port: u16) -> anyhow::Result<()> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("无法连接 {host}:{port}（超时）"))?
+    .map_err(|error| anyhow::anyhow!("无法连接 {host}:{port}：{error}"))?;
+    Ok(())
 }
 
 #[async_trait(?Send)]
@@ -858,13 +991,22 @@ impl LaunchHooks for DefaultLaunchHooks {
         &self,
         app_dir: &Path,
         debug_port: u16,
+        helper_port: u16,
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
         let native_menu_localization_enabled = settings.codex_app_native_menu_localization;
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
-        let launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
+        let mut launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
+        // 受管网关开启时，Windows packaged activation 追加唯一受管 PAC 参数，
+        // 并清理用户自带的 --proxy-pac-url / --proxy-server 冲突参数。
+        if cfg!(windows) && settings.windows_managed_gateway_enabled {
+            launch_extra_args = crate::managed_gateway::inject_managed_pac_arg(
+                &launch_extra_args,
+                helper_port,
+            );
+        }
         if cfg!(windows) {
             let activation = if let Some(inspector_port) = native_menu_inspector_port {
                 build_packaged_activation_with_native_menu_inspector(
@@ -1080,8 +1222,8 @@ impl LaunchHooks for DefaultLaunchHooks {
                 }
             }
             CodexLaunch::PackagedActivation { process_id, .. } => {
-                if let Some(process_id) = process_id {
-                    if let Err(error) = wait_for_windows_process_id(*process_id).await {
+                if let Some(process_id) = process_id
+                    && let Err(error) = wait_for_windows_process_id(*process_id).await {
                         let _ = crate::diagnostic_log::append_diagnostic_log(
                             "launcher.packaged_process_wait_failed_nonfatal",
                             serde_json::json!({
@@ -1090,7 +1232,6 @@ impl LaunchHooks for DefaultLaunchHooks {
                             }),
                         );
                     }
-                }
             }
         }
         let mut empty_streak = 0u32;
@@ -1200,6 +1341,37 @@ async fn handle_helper_connection(
             "body_bytes": request.body.len()
         }),
     );
+
+    if crate::managed_gateway::is_proxy_pac_path(path) && method == "GET" {
+        let body = crate::managed_gateway::build_pac_script();
+        write_http_response(
+            &mut stream,
+            "200 OK",
+            "application/x-ns-proxy-autoconfig",
+            body.as_bytes(),
+        )
+        .await?;
+        log_helper_response(
+            "helper.managed_proxy_pac_ok",
+            method,
+            path,
+            "200 OK",
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
+    if crate::managed_gateway::is_proxy_pac_path(path) && method == "OPTIONS" {
+        write_http_response(
+            &mut stream,
+            "204 No Content",
+            "application/x-ns-proxy-autoconfig",
+            &[],
+        )
+        .await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
 
     if crate::protocol_proxy::is_audio_transcriptions_proxy_path(path) && method == "POST" {
         return handle_audio_transcriptions_proxy_connection(
@@ -1412,9 +1584,7 @@ async fn handle_helper_connection(
         }),
     );
     let response = if method == "OPTIONS" {
-        format!(
-            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        )
+        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
     } else {
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -3518,6 +3688,39 @@ mod tests {
         let response = send_raw_helper_request(&request).await;
 
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn helper_serves_managed_proxy_pac_with_fixed_content() {
+        let response = send_raw_helper_request(
+            b"GET /proxy.pac HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("application/x-ns-proxy-autoconfig"));
+        assert!(response.contains("FindProxyForURL"));
+        assert!(response.contains("SOCKS5 10.20.30.61:7891"));
+        // 命中结果不追加 DIRECT 回退（避免 SOCKS5 不可用时静默直连）
+        assert!(!response.contains("; DIRECT"));
+    }
+
+    #[test]
+    fn packaged_activation_includes_unique_managed_pac_arg_when_enabled() {
+        let args = crate::managed_gateway::inject_managed_pac_arg(
+            &["--proxy-server=socks5://evil:1".to_string()],
+            57321,
+        );
+        let arguments = command_line_arguments(&build_codex_arguments(9229, &args));
+        assert!(arguments.contains("--proxy-pac-url=http://127.0.0.1:57321/proxy.pac"));
+        assert!(!arguments.contains("--proxy-server"));
+        assert_eq!(
+            arguments
+                .matches("--proxy-pac-url=")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
